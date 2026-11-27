@@ -744,6 +744,8 @@ var PHOTOS=window.PHOTOS||{};
 /* embedded photos (data URIs) win; catalogue photos are files: img/<code>.webp (large) and img/t/<code>.webp (thumbnail) */
 function photoURL(k){return PHOTOS[k]||('img/'+k+'.webp');}
 function thumbURL(k){return PHOTOS[k]||('img/t/'+k+'.webp');}
+/* if a small picture (img/t/...) is missing, quietly use the full-size picture instead, so a product card is never left empty */
+document.addEventListener('error',function(e){var im=e.target;if(im&&im.tagName==='IMG'&&!im.dataset.fb&&/\/img\/t\/[^\/]+$/.test(im.src)){im.dataset.fb='1';im.src=im.src.replace('/img/t/','/img/');}},true);
 PRODUCTS.forEach(function(p){if(p.photos)thumbs[p.id+':']=thumbURL(p.photos[0].k);});
 
 function t(k){var d=I18N[LANG];return (d&&d[k]!=null)?d[k]:(I18N.en[k]!=null?I18N.en[k]:k);}
