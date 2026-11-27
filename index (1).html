@@ -1008,6 +1008,7 @@ $$('canvas.art').forEach(function(cv){drawShelf(cv,+cv.getAttribute('data-seed')
 window.MAAREF={
  products:PRODUCTS,
  photoURL:photoURL,
+ peek:function(n){var v=visible(),i=-1;for(var j=0;j<v.length;j++)if(v[j].id===state.selected)i=j;return v.slice(i+1,i+1+n).filter(function(p){return p.photos;}).map(function(p){return p.photos[0].k;});},
  current:function(){var p=find(state.selected);return {id:p.id,variant:variantKey(p),photo:photoKey(p)};}
 };
 /* messages from the 3D module: WebGL works / a photo model is ready / a photo model could not be built */
@@ -1262,12 +1263,14 @@ function disposeTree(o){
 /* ---------- photo products: cut the photo out of its white background and give it real thickness, so it turns like a standee ---------- */
 /* White products on a white photo cannot be cut out cleanly, so these keep the whole photo as a rounded slab.
    If a new photo looks torn in 3D, add its code (the file name in img/) to this list. */
-const SLAB=new Set(['10062','10152','10157','10172','10192','10212','10244','10276']);
-const photoCache=new Map();
+const SLAB=['10062','10152','10157','10172','10192','10212','10244','10276'];
+const PHOTO_L=2.8,PHOTO_D=.14,PHOTO_PX=640;
+const photoCache=new Map(),inflight=new Map();
 const loadImg=url=>new Promise((res,rej)=>{const im=new Image();im.onload=()=>res(im);im.onerror=()=>rej(new Error('image failed: '+url));im.src=url;});
 
-/* paint a soft-edged mask: 3x3 box blur twice, 0..255 */
-function softAlpha(fg,W,H){
+/* The pixel work below touches no THREE and no page, so it runs in a Web Worker (the page keeps scrolling and turning while a
+   product is being prepared). If workers are not available it runs on the page itself. These functions must stay self-contained. */
+function softAlpha(fg,W,H){ /* soft-edged mask: 3x3 box blur twice, 0..255 */
   const a=new Uint16Array(W*H),t=new Uint16Array(W*H);
   for(let i=0;i<a.length;i++)a[i]=fg[i]?255:0;
   for(let pass=0;pass<2;pass++){
@@ -1283,39 +1286,8 @@ function erode(a,W,H,n){
     a.set(b);
   }
 }
-/* find the product's outline: flood the near-white background in from the photo's edge */
-function outline(img,k){
-  const sc=Math.min(1,768/Math.max(img.naturalWidth,img.naturalHeight));
-  const W=Math.max(4,Math.round(img.naturalWidth*sc)),H=Math.max(4,Math.round(img.naturalHeight*sc)),N=W*H;
-  const cv=document.createElement('canvas');cv.width=W;cv.height=H;
-  const g=cv.getContext('2d',{willReadFrequently:true});g.drawImage(img,0,0,W,H);
-  const px=g.getImageData(0,0,W,H).data;
-  const fg=new Uint8Array(N).fill(1);let cut=false;
-  if(!SLAB.has(k)){
-    const near=new Uint8Array(N);
-    for(let i=0;i<N;i++){const r=px[i*4],gr=px[i*4+1],b=px[i*4+2],mn=Math.min(r,gr,b);near[i]=(mn>=226&&Math.max(r,gr,b)-mn<=22)?1:0;}
-    let bn=0,bt=0;
-    for(let x=0;x<W;x++){bt+=2;bn+=near[x]+near[(H-1)*W+x];}
-    for(let y=1;y<H-1;y++){bt+=2;bn+=near[y*W]+near[y*W+W-1];}
-    if(bn/bt>=.9){ /* the photo has a white backdrop */
-      const stack=new Int32Array(N);let sp=0;
-      const push=i=>{if(near[i]===1){near[i]=2;stack[sp++]=i;}};
-      for(let x=0;x<W;x++){push(x);push((H-1)*W+x);}
-      for(let y=1;y<H-1;y++){push(y*W);push(y*W+W-1);}
-      while(sp){const i=stack[--sp],x=i%W;if(x>0)push(i-1);if(x<W-1)push(i+1);if(i>=W)push(i-W);if(i<N-W)push(i+W);}
-      let n=0;for(let i=0;i<N;i++){fg[i]=near[i]===2?0:1;n+=fg[i];}
-      if(n/N>=.04){cut=true;erode(fg,W,H,2);}else{fg.fill(1);}
-    }
-  }
-  if(!cut){ /* whole photo: round the corners a little */
-    const r=Math.round(Math.min(W,H)*.035);
-    for(let y=0;y<r;y++)for(let x=0;x<r;x++){const dx=r-x-.5,dy=r-y-.5;if(dx*dx+dy*dy>r*r){fg[y*W+x]=0;fg[y*W+W-1-x]=0;fg[(H-1-y)*W+x]=0;fg[(H-1-y)*W+W-1-x]=0;}}
-  }
-  return {W,H,px,fg,cut};
-}
-/* the thin side wall: one little quad for every cell of the outline that touches empty space */
-function sideWalls(o,s,D){
-  const {W,H,fg}=o,cs=Math.max(2,Math.round(Math.max(W,H)/200)),gw=Math.ceil(W/cs),gh=Math.ceil(H/cs);
+function wallData(fg,W,H,s,D){ /* the thin side wall: one little quad for every cell of the outline that touches empty space */
+  const cs=Math.max(2,Math.round(Math.max(W,H)/180)),gw=Math.ceil(W/cs),gh=Math.ceil(H/cs);
   const cell=new Float32Array(gw*gh);
   for(let cy=0;cy<gh;cy++)for(let cx=0;cx<gw;cx++){
     let n=0,c=0;for(let y=cy*cs;y<Math.min(H,(cy+1)*cs);y++)for(let x=cx*cs;x<Math.min(W,(cx+1)*cs);x++){c++;n+=fg[y*W+x];}
@@ -1337,52 +1309,128 @@ function sideWalls(o,s,D){
   for(let cy=0;cy<gh;cy++)for(let cx=0;cx<gw;cx++){
     if(!filled(cx,cy))continue;
     const xa=(cx*cs-W/2)*s,xb=(Math.min(W,(cx+1)*cs)-W/2)*s,yb=(H/2-cy*cs)*s,ya=(H/2-Math.min(H,(cy+1)*cs))*s;
-    let nx=-(at(cx+1,cy)-at(cx-1,cy)),ny=(at(cx,cy+1)-at(cx,cy-1));const nl=Math.hypot(nx,ny);
-    const smooth=nl>.04?[nx/nl,ny/nl]:null;
+    const nx=-(at(cx+1,cy)-at(cx-1,cy)),ny=(at(cx,cy+1)-at(cx,cy-1)),nl=Math.hypot(nx,ny),smooth=nl>.04?[nx/nl,ny/nl]:null;
     if(!filled(cx-1,cy))quad([xa,ya,zb],[xa,ya,zf],[xa,yb,zf],[xa,yb,zb],[-1,0],smooth||[-1,0]);
     if(!filled(cx+1,cy))quad([xb,ya,zb],[xb,ya,zf],[xb,yb,zf],[xb,yb,zb],[1,0],smooth||[1,0]);
     if(!filled(cx,cy-1))quad([xa,yb,zb],[xb,yb,zb],[xb,yb,zf],[xa,yb,zf],[0,1],smooth||[0,1]);
     if(!filled(cx,cy+1))quad([xa,ya,zb],[xb,ya,zb],[xb,ya,zf],[xa,ya,zf],[0,-1],smooth||[0,-1]);
   }
-  const geo=new THREE.BufferGeometry();
-  geo.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
-  geo.setAttribute('normal',new THREE.Float32BufferAttribute(nor,3));
-  geo.setIndex(new THREE.BufferAttribute(Uint32Array.from(idx),1));
-  return geo;
+  return {pos:new Float32Array(pos),nor:new Float32Array(nor),idx:Uint32Array.from(idx)};
 }
-/* a glossy glint that slides across the photo while it turns (shared by every photo model) */
-let sheenU=null; /* created with the first photo model, because THREE only exists after the library has loaded */
-function buildPhoto(renderer,img,k){
-  if(!sheenU)sheenU={value:new THREE.Vector2(.5,.13)};
-  const o=outline(img,k),{W,H,px}=o,L=2.8,D=.14,s=L/Math.max(W,H),w=W*s,h=H*s;
-  const alpha=softAlpha(o.fg,W,H),front=new Uint8Array(W*H*4),back=new Uint8Array(W*H*4);
+/* px = RGBA pixels of the photo (W x H). Finds the outline by flooding the near-white backdrop in from the photo's edge,
+   then returns the texture pixels (bottom row first) and the side-wall mesh. */
+function processPhoto(px,W,H,k,slab,L,D){
+  const N=W*H,fg=new Uint8Array(N).fill(1);let cut=false;
+  if(slab.indexOf(k)<0){
+    const near=new Uint8Array(N);
+    for(let i=0;i<N;i++){const r=px[i*4],gr=px[i*4+1],b=px[i*4+2],mn=Math.min(r,gr,b);near[i]=(mn>=226&&Math.max(r,gr,b)-mn<=22)?1:0;}
+    let bn=0,bt=0;
+    for(let x=0;x<W;x++){bt+=2;bn+=near[x]+near[(H-1)*W+x];}
+    for(let y=1;y<H-1;y++){bt+=2;bn+=near[y*W]+near[y*W+W-1];}
+    if(bn/bt>=.9){ /* the photo has a white backdrop */
+      const stack=new Int32Array(N);let sp=0;
+      const push=i=>{if(near[i]===1){near[i]=2;stack[sp++]=i;}};
+      for(let x=0;x<W;x++){push(x);push((H-1)*W+x);}
+      for(let y=1;y<H-1;y++){push(y*W);push(y*W+W-1);}
+      while(sp){const i=stack[--sp],x=i%W;if(x>0)push(i-1);if(x<W-1)push(i+1);if(i>=W)push(i-W);if(i<N-W)push(i+W);}
+      let n=0;for(let i=0;i<N;i++){fg[i]=near[i]===2?0:1;n+=fg[i];}
+      if(n/N>=.04){cut=true;erode(fg,W,H,2);}else{fg.fill(1);}
+    }
+  }
+  if(!cut){ /* the whole photo: round the corners a little */
+    const r=Math.round(Math.min(W,H)*.035);
+    for(let y=0;y<r;y++)for(let x=0;x<r;x++){const dx=r-x-.5,dy=r-y-.5;if(dx*dx+dy*dy>r*r){fg[y*W+x]=0;fg[y*W+W-1-x]=0;fg[(H-1-y)*W+x]=0;fg[(H-1-y)*W+W-1-x]=0;}}
+  }
+  const alpha=softAlpha(fg,W,H),front=new Uint8Array(N*4);
   for(let y=0;y<H;y++)for(let x=0;x<W;x++){
     const si=y*W+x,d=((H-1-y)*W+x)*4;
     front[d]=px[si*4];front[d+1]=px[si*4+1];front[d+2]=px[si*4+2];front[d+3]=alpha[si];
-    back[d]=236;back[d+1]=230;back[d+2]=214;back[d+3]=alpha[si];
   }
-  const tex=data=>{const t=new THREE.DataTexture(data,W,H,THREE.RGBAFormat,THREE.UnsignedByteType);
-    t.colorSpace=THREE.SRGBColorSpace;t.generateMipmaps=true;t.minFilter=THREE.LinearMipmapLinearFilter;t.magFilter=THREE.LinearFilter;
-    t.anisotropy=Math.min(8,renderer.capabilities.getMaxAnisotropy());t.needsUpdate=true;return t;};
-  const fMat=new THREE.MeshBasicMaterial({map:tex(front),alphaTest:.4,alphaToCoverage:true});
-  fMat.onBeforeCompile=sh=>{
+  const w=wallData(fg,W,H,L/Math.max(W,H),D);
+  return {W,H,cut,front,pos:w.pos,nor:w.nor,idx:w.idx};
+}
+function workerSource(){
+  return [softAlpha,erode,wallData,processPhoto].map(f=>f.toString()).join('\n')+`
+self.onmessage=async e=>{
+  const m=e.data;
+  try{
+    const res=await fetch(m.url);if(!res.ok)throw new Error('HTTP '+res.status);
+    const bmp=await createImageBitmap(await res.blob());
+    const sc=Math.min(1,m.max/Math.max(bmp.width,bmp.height)),W=Math.max(4,Math.round(bmp.width*sc)),H=Math.max(4,Math.round(bmp.height*sc));
+    const g=new OffscreenCanvas(W,H).getContext('2d',{willReadFrequently:true});g.drawImage(bmp,0,0,W,H);if(bmp.close)bmp.close();
+    const o=processPhoto(g.getImageData(0,0,W,H).data,W,H,m.k,m.slab,m.L,m.D);
+    self.postMessage({id:m.id,out:o},[o.front.buffer,o.pos.buffer,o.nor.buffer,o.idx.buffer]);
+  }catch(err){self.postMessage({id:m.id,error:String((err&&err.message)||err)});}
+};`;
+}
+let worker=null,workerFails=0,reqId=0;
+const waiting=new Map();
+let workerOff=typeof Worker==='undefined'||typeof OffscreenCanvas==='undefined'||typeof createImageBitmap==='undefined';
+function getWorker(){
+  if(worker)return worker;
+  worker=new Worker(URL.createObjectURL(new Blob([workerSource()],{type:'text/javascript'})));
+  worker.onmessage=e=>{const w=waiting.get(e.data.id);if(!w)return;waiting.delete(e.data.id);if(e.data.error)w.rej(new Error(e.data.error));else w.res(e.data.out);};
+  worker.onerror=()=>{workerOff=true;for(const w of waiting.values())w.rej(new Error('worker failed'));waiting.clear();};
+  return worker;
+}
+function photoData(k){
+  const url=new URL(window.MAAREF.photoURL(k),document.baseURI).href;
+  const onPage=()=>loadImg(url).then(img=>{
+    const sc=Math.min(1,PHOTO_PX/Math.max(img.naturalWidth,img.naturalHeight)),W=Math.max(4,Math.round(img.naturalWidth*sc)),H=Math.max(4,Math.round(img.naturalHeight*sc));
+    const cv=document.createElement('canvas');cv.width=W;cv.height=H;
+    const g=cv.getContext('2d',{willReadFrequently:true});g.drawImage(img,0,0,W,H);
+    return processPhoto(g.getImageData(0,0,W,H).data,W,H,k,SLAB,PHOTO_L,PHOTO_D);
+  });
+  if(workerOff)return onPage();
+  return new Promise((res,rej)=>{
+    const id=++reqId;waiting.set(id,{res,rej});
+    try{getWorker().postMessage({id,url,k,slab:SLAB,L:PHOTO_L,D:PHOTO_D,max:PHOTO_PX});}catch(e){waiting.delete(id);rej(e);}
+  }).catch(err=>{console.warn('[maaref] worker could not prepare',k,'- using the page instead:',err.message);if(++workerFails>=2)workerOff=true;return onPage();});
+}
+/* a glossy glint that slides across the photo while it turns (shared by every photo model) */
+let sheenU=null; /* created with the first photo model, because THREE only exists after the library has loaded */
+function photoTexture(renderer,data,W,H){
+  const t=new THREE.DataTexture(data,W,H,THREE.RGBAFormat,THREE.UnsignedByteType);
+  t.colorSpace=THREE.SRGBColorSpace;t.generateMipmaps=true;t.minFilter=THREE.LinearMipmapLinearFilter;t.magFilter=THREE.LinearFilter;
+  t.anisotropy=Math.min(4,renderer.capabilities.getMaxAnisotropy());t.needsUpdate=true;return t;
+}
+function photoMaterials(tex){
+  if(!sheenU)sheenU={value:new THREE.Vector2(.5,.13)};
+  const front=new THREE.MeshBasicMaterial({map:tex,alphaTest:.4,alphaToCoverage:true});
+  front.onBeforeCompile=sh=>{
     sh.uniforms.uSheen=sheenU;
     sh.fragmentShader=sh.fragmentShader.replace('#include <common>','#include <common>\nuniform vec2 uSheen;')
       .replace('#include <opaque_fragment>','outgoingLight+=vec3(smoothstep(0.0,.2,.2-abs(vMapUv.x*.75+vMapUv.y*.55-uSheen.x))*uSheen.y);\n#include <opaque_fragment>');
   };
-  fMat.customProgramCacheKey=()=>'maaref-photo-glint';
-  const bMat=new THREE.MeshStandardMaterial({map:tex(back),alphaTest:.4,alphaToCoverage:true,roughness:.8,metalness:0});
-  const wMat=new THREE.MeshStandardMaterial({color:0xe6dfcc,roughness:.62,metalness:0});
-  const fm=new THREE.Mesh(new THREE.PlaneGeometry(w,h),fMat);fm.position.z=D/2;
-  const bg=new THREE.PlaneGeometry(w,h),uv=bg.attributes.uv;for(let i=0;i<uv.count;i++)uv.setX(i,1-uv.getX(i));
-  const bm=new THREE.Mesh(bg,bMat);bm.rotation.y=Math.PI;bm.position.z=-D/2;
-  const group=new THREE.Group();group.add(fm,bm,new THREE.Mesh(sideWalls(o,s,D),wMat));
-  group.userData={photo:true,cached:true,s:1,key:k};
-  return {group,w,h,cut:o.cut};
+  front.customProgramCacheKey=()=>'maaref-photo-glint';
+  /* the back shares the same texture (only its outline is used) and is painted plain cardboard */
+  const back=new THREE.MeshStandardMaterial({map:tex,color:0xece6d6,alphaTest:.4,alphaToCoverage:true,roughness:.8,metalness:0});
+  back.onBeforeCompile=sh=>{sh.fragmentShader=sh.fragmentShader.replace('#include <map_fragment>','diffuseColor.a*=texture2D(map,vMapUv).a;');};
+  back.customProgramCacheKey=()=>'maaref-photo-back';
+  const wall=new THREE.MeshStandardMaterial({color:0xe6dfcc,roughness:.62,metalness:0});
+  return {front,back,wall};
 }
+function modelFromData(renderer,d,k){
+  const {W,H}=d,s=PHOTO_L/Math.max(W,H),w=W*s,h=H*s,m=photoMaterials(photoTexture(renderer,d.front,W,H));
+  const fm=new THREE.Mesh(new THREE.PlaneGeometry(w,h),m.front);fm.position.z=PHOTO_D/2;
+  const bg=new THREE.PlaneGeometry(w,h),uv=bg.attributes.uv;for(let i=0;i<uv.count;i++)uv.setX(i,1-uv.getX(i));
+  const bm=new THREE.Mesh(bg,m.back);bm.rotation.y=Math.PI;bm.position.z=-PHOTO_D/2;
+  const wg=new THREE.BufferGeometry();
+  wg.setAttribute('position',new THREE.BufferAttribute(d.pos,3));wg.setAttribute('normal',new THREE.BufferAttribute(d.nor,3));wg.setIndex(new THREE.BufferAttribute(d.idx,1));
+  const group=new THREE.Group();group.add(fm,bm,new THREE.Mesh(wg,m.wall));
+  group.userData={photo:true,cached:true,s:1,key:k};
+  return {group,w,h,cut:d.cut,tex:m.front.map};
+}
+/* keep the last few models so tapping back is instant; never throw away the one on screen */
 function rememberPhoto(k,m,keep){
-  photoCache.set(k,m);
-  for(const [key,old] of photoCache){if(photoCache.size<=5)break;if(key===k||key===keep)continue;disposeTree(old.group);photoCache.delete(key);}
+  photoCache.delete(k);photoCache.set(k,m);
+  for(const [key,old] of photoCache){if(photoCache.size<=6)break;if(key===k||key===keep)continue;disposeTree(old.group);photoCache.delete(key);}
+}
+function getModel(renderer,k,keepKey){
+  const hit=photoCache.get(k);if(hit)return Promise.resolve(hit);
+  if(inflight.has(k))return inflight.get(k);
+  const p=photoData(k).then(d=>{const m=modelFromData(renderer,d,k);rememberPhoto(k,m,keepKey());return m;}).finally(()=>inflight.delete(k));
+  inflight.set(k,p);return p;
 }
 
 /* ---------- stage: renderer + lights + soft floor shadow ---------- */
@@ -1423,22 +1471,38 @@ function createStage(canvas,opts){
   }
   return S;
 }
+let lastFrame=0,slowFrames=0,seenFrames=0;
 function loop(now){
-  requestAnimationFrame(loop);if(document.hidden)return;
-  const t=now/1000;
+  requestAnimationFrame(loop);if(document.hidden){lastFrame=0;return;}
+  const t=now/1000,ft=lastFrame?now-lastFrame:16;lastFrame=now;
+  let drew=false;
   for(const S of stages){
     if(!S.visible)continue;
     if(S.update)S.update(t);
-    if(S.animated||S.dirty){S.renderer.render(S.scene,S.camera);S.dirty=false;}
+    if(S.animated||S.dirty){S.renderer.render(S.scene,S.camera);S.dirty=false;drew=true;}
+  }
+  /* if this device cannot keep up, quietly draw the 3D at a lower resolution (never below 1.25x) so it stays smooth */
+  if(drew&&ft<250){
+    seenFrames++;if(ft>30)slowFrames++;
+    if(seenFrames>=45){
+      if(slowFrames>=22)for(const S of stages){const pr=S.renderer.getPixelRatio();if(pr>1.25){S.renderer.setPixelRatio(Math.max(1.25,pr-.5));S.resize();}}
+      seenFrames=0;slowFrames=0;
+    }
   }
 }
 /* drag to rotate; vertical touch still scrolls the page (touch-action: pan-y) */
 function dragger(canvas,S,st){
-  let d=null;
-  canvas.addEventListener('pointerdown',e=>{d={x:e.clientX,y:e.clientY};try{canvas.setPointerCapture(e.pointerId);}catch(_){}st.vel=0;});
+  let d=null,rect=null;
+  const fresh=()=>{rect=null;};window.addEventListener('scroll',fresh,{passive:true});window.addEventListener('resize',fresh);
+  canvas.addEventListener('pointerdown',e=>{d={x:e.clientX,y:e.clientY};rect=null;try{canvas.setPointerCapture(e.pointerId);}catch(_){}st.vel=0;});
   canvas.addEventListener('pointermove',e=>{
-    const r=canvas.getBoundingClientRect();st.px=((e.clientX-r.left)/r.width-.5)*2;st.py=((e.clientY-r.top)/r.height-.5)*2;
-    if(d){const dx=e.clientX-d.x,dy=e.clientY-d.y;d.x=e.clientX;d.y=e.clientY;st.yaw+=dx*.009;st.vel=dx*.009;st.pitch=clamp(st.pitch+dy*.004,-.4,.4);}
+    const sens=st.sens||.009;
+    if(d){
+      const dx=e.clientX-d.x,dy=e.clientY-d.y;d.x=e.clientX;d.y=e.clientY;
+      st.yaw+=dx*sens;st.vel=clamp(dx*sens,-.3,.3);st.pitch=clamp(st.pitch+dy*sens*.45,-.4,.4);
+    }else{
+      rect=rect||canvas.getBoundingClientRect();st.px=((e.clientX-rect.left)/rect.width-.5)*2;st.py=((e.clientY-rect.top)/rect.height-.5)*2;
+    }
     S.dirty=true;
   });
   const end=()=>{d=null;};
@@ -1486,45 +1550,51 @@ let viewer=null;
 function buildViewer(){
   const canvas=document.getElementById('viewCanvas'),S=createStage(canvas,{fov:30,camZ:7,groundY:-1.55});
   const pivot=new THREE.Group();S.scene.add(pivot);
-  const st={yaw:.5,pitch:.12,vel:0,px:0,py:0};dragger(canvas,S,st);
+  const st={yaw:.5,pitch:.12,vel:0,px:0,py:0,sens:.009,t:0};dragger(canvas,S,st);
   const blob=S.makeBlob(1.2,.42);let cur=null,born=0,token=0;
+  /* compile the photo shaders now, while the page starts up, so the first product tap does not stall */
+  {const m=photoMaterials(photoTexture(S.renderer,new Uint8Array(16).fill(255),2,2)),g=new THREE.Group();
+   [m.front,m.back,m.wall].forEach(mt=>g.add(new THREE.Mesh(new THREE.PlaneGeometry(.01,.01),mt)));
+   pivot.add(g);const done=()=>pivot.remove(g);
+   try{(S.renderer.compileAsync?S.renderer.compileAsync(S.scene,S.camera):Promise.resolve(S.renderer.compile(S.scene,S.camera))).then(done,done);}catch(_){done();}}
   S.update=t=>{
+    const dt=Math.min(.05,st.t?t-st.t:.016),f=dt*60;st.t=t; /* f = how many 60 fps frames this one is worth, so motion is the same on 60 and 120 Hz screens */
     if(cur&&cur.userData.photo){
       /* a photo model rocks gently, and after a spin it settles back to face the customer */
       const sway=S.animated?Math.sin(t*.7)*.5:0;
       if(!st.dragging){
-        st.yaw+=st.vel;
+        st.yaw+=st.vel*f;
         const dy=Math.round(st.yaw/TAU)*TAU+sway-st.yaw;
-        st.yaw+=dy*(Math.abs(st.vel)>.004?.012:.07);
-        st.pitch+=((S.animated?Math.sin(t*.5)*.05:0)+.05-st.pitch)*.06;
+        st.yaw+=dy*(1-Math.pow(1-(Math.abs(st.vel)>.004?.012:.07),f));
+        st.pitch+=((S.animated?Math.sin(t*.5)*.05:0)+.05-st.pitch)*(1-Math.pow(.94,f));
         if(Math.abs(dy)>.002||Math.abs(st.vel)>.001)S.dirty=true;
       }
-      st.vel*=.92;
+      st.vel*=Math.pow(.92,f);
       sheenU.value.set(.5+Math.sin(st.yaw*1.25),.13);
     }else{
-      if(S.animated&&!st.dragging)st.yaw+=.006+st.vel;else if(!st.dragging){st.yaw+=st.vel;}
-      st.vel*=.92;
+      if(S.animated&&!st.dragging)st.yaw+=(.006+st.vel)*f;else if(!st.dragging){st.yaw+=st.vel*f;}
+      st.vel*=Math.pow(.92,f);
     }
     pivot.rotation.y=st.yaw;pivot.rotation.x=st.pitch;
     if(cur){const k=clamp((t-born)/.35,0,1),e=1-Math.pow(1-k,3);cur.scale.setScalar(cur.userData.s*(.82+.18*e));if(k<1)S.dirty=true;}
   };
   const swap=(obj,r)=>{
     if(cur){pivot.remove(cur);if(!cur.userData.cached)disposeTree(cur);}
-    cur=obj;pivot.add(cur);born=performance.now()/1000;blob.scale.set(r*2,r*2,1);S.dirty=true;
+    cur=obj;pivot.add(cur);born=performance.now()/1000;blob.scale.set(r*2,r*2,1);st.sens=cur.userData.photo?.017:.009;S.dirty=true;
   };
+  const keepKey=()=>cur&&cur.userData.key;
   const showPhoto=(prod,k,my)=>{
     const ready=m=>{
       if(my!==token)return;
       st.yaw=Math.round(st.yaw/TAU)*TAU+.45;st.vel=0;
       swap(m.group,Math.min(1.5,.4*m.w+.25));
       window.dispatchEvent(new CustomEvent('maaref:photoready',{detail:{id:prod.id,photo:k}}));
+      /* quietly get the next two products ready, so the next tap is instant */
+      (window.requestIdleCallback||setTimeout)(()=>{for(const nk of window.MAAREF.peek(2))getModel(S.renderer,nk,keepKey).then(pm=>{try{S.renderer.initTexture(pm.tex);}catch(_){}}).catch(()=>{});});
     };
     const hit=photoCache.get(k);
     if(hit){photoCache.delete(k);photoCache.set(k,hit);ready(hit);return;}
-    loadImg(window.MAAREF.photoURL(k)).then(img=>{
-      if(my!==token)return;
-      const m=buildPhoto(S.renderer,img,k);rememberPhoto(k,m,cur&&cur.userData.key);ready(m);
-    }).catch(err=>{
+    getModel(S.renderer,k,keepKey).then(m=>{if(my===token)ready(m);}).catch(err=>{
       console.warn('[maaref] no 3D for photo',k,err);
       window.dispatchEvent(new CustomEvent('maaref:photofail',{detail:{id:prod.id,photo:k}}));
     });
